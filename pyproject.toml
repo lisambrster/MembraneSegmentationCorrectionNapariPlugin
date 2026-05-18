@@ -22,7 +22,7 @@ dependencies = [
 fast = ["numba"]   # speeds up label-overlap computation in paircheck
 
 [project.entry-points."napari.manifest"]
-membrane_plugin = "membrane_plugin:napari.yaml"
+membrane-segmentation-correction = "membrane_plugin:napari.yaml"
 
 [project.scripts]
 register-sequence = "register_sequence:main"

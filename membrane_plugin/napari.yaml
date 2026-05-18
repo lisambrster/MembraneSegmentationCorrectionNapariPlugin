@@ -1,13 +1,13 @@
-name: membrane_plugin
+name: membrane-segmentation-correction
 display_name: Membrane Segmentation Correction
 
 contributions:
   commands:
-    - id: membrane_plugin.open_tiff
-      title: Open 3D TIFF
+    - id: membrane-segmentation-correction.open_tiff
+      title: Membrane Segmentation Correction
       python_name: membrane_plugin._widget:TiffReaderWidget
 
   widgets:
-    - command: membrane_plugin.open_tiff
+    - command: membrane-segmentation-correction.open_tiff
       display_name: Membrane Segmentation Correction
       autogenerate: false

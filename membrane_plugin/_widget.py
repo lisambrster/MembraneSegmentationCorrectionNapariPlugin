@@ -13,7 +13,7 @@ from qtpy.QtWidgets import (
 )
 import napari
 from napari.qt import thread_worker
-from membrane_plugin._cleaning import prep, remove_bad_slices
+from membrane_plugin._cleaning import prep, remove_bad_slices, auto_slice_range
 from membrane_plugin._registration import (
     prep_array, register_multiscale,
     euler_angles_to_rotation_matrix, warp_to_original_space,
@@ -32,12 +32,13 @@ def _save_config(data: dict):
     _CONFIG.write_text(json.dumps(data))
 
 
-def _find_frame(directory: Path, frame_num: int) -> Path | None:
+def _find_frame(directory: Path, frame_num: int, prefer_corrected: bool = True) -> Path | None:
     """Return the best tiff in *directory* whose name contains *frame_num*.
 
     Looks inside the 'membrane_segmentation' subdirectory of *directory* if it
-    exists, otherwise uses *directory* directly.  Among matching files, prefers
-    a 'corrected' variant over a plain one.
+    exists, otherwise uses *directory* directly.  When *prefer_corrected* is
+    True (default), a 'corrected' variant is returned over a plain one;
+    when False, the plain (non-corrected) variant is preferred.
     """
     seg_dir = directory / "membrane_segmentation"
     search_dir = seg_dir if seg_dir.is_dir() else directory
@@ -54,9 +55,11 @@ def _find_frame(directory: Path, frame_num: int) -> Path | None:
 
     if not candidates:
         return None
-    # prefer corrected version
-    corrected = [f for f in candidates if 'corrected' in f.name.lower()]
-    return corrected[0] if corrected else candidates[0]
+    corrected   = [f for f in candidates if 'corrected' in f.name.lower()]
+    uncorrected = [f for f in candidates if 'corrected' not in f.name.lower()]
+    if prefer_corrected:
+        return corrected[0] if corrected else candidates[0]
+    return uncorrected[0] if uncorrected else candidates[0]
 
 
 def _prev_file(path: Path) -> Path | None:
@@ -285,11 +288,15 @@ the limit before converging (cost still dropping at last iteration).
         layout.addWidget(self._results)
         layout.addWidget(self.label)
         layout.addStretch()
-        self._check_result    = None   # stores last check output
-        self._layer_prev      = None   # Labels layer for frame N-1
-        self._layer_curr      = None   # Labels layer for frame N
-        self._layer_reg       = None   # registered prev frame (output of registration)
-        self._original_scales = {}     # layer → original scale (for resolution toggle)
+        self._check_result       = None   # stores last check output
+        self._layer_prev         = None   # Labels layer for frame N-1
+        self._layer_curr         = None   # Labels layer for frame N
+        self._layer_reg          = None   # registered corrected prev frame
+        self._layer_reg_orig     = None   # registered original (non-corrected) prev frame
+        self._prev_orig_path     = None   # path to non-corrected prev frame
+        self._reg_save_path      = None
+        self._orig_reg_save_path = None
+        self._original_scales    = {}     # layer → original scale (for resolution toggle)
         self.setLayout(layout)
 
     def _load_as_labels(self, path: Path):
@@ -340,21 +347,33 @@ the limit before converging (cost still dropping at last iteration).
             msgs.append(f"(no raw image found for frame {frame_num})")
 
         # label images from membrane_segmentation
-        self._layer_prev = None
-        self._layer_reg  = None
-        self._reg_save_path = None
+        self._layer_prev         = None
+        self._layer_reg          = None
+        self._layer_reg_orig     = None
+        self._reg_save_path      = None
+        self._orig_reg_save_path = None
+        self._prev_orig_path     = None
         self._curr_path = path
         prev_path = _prev_file(path)
         if prev_path:
             self._layer_prev, prev_shape, prev_dtype = self._load_as_labels(prev_path)
             msgs.append(f"Labels frame {prev_num}: {prev_path.name}  {prev_shape}  {prev_dtype}")
 
-            # check for a previously saved registered version
+            # original (non-corrected) prev frame — used for dual warp
+            prev_orig = _find_frame(prev_path.parent, prev_num, prefer_corrected=False)
+            self._prev_orig_path = prev_orig if prev_orig != prev_path else None
+
+            # check for previously saved registered versions
             reg_path = prev_path.parent / f"registered_to_{frame_num}{prev_path.suffix}"
+            orig_reg_path = prev_path.parent / f"original_registered_to_{frame_num}{prev_path.suffix}"
             if reg_path.exists():
                 self._layer_reg, reg_shape, reg_dtype = self._load_as_labels(reg_path)
                 msgs.append(f"Registered frame {prev_num}: {reg_path.name}  {reg_shape}  {reg_dtype}")
-            self._reg_save_path = reg_path
+            if orig_reg_path.exists():
+                self._layer_reg_orig, o_shape, o_dtype = self._load_as_labels(orig_reg_path)
+                msgs.append(f"Original registered {prev_num}: {orig_reg_path.name}  {o_shape}  {o_dtype}")
+            self._reg_save_path      = reg_path
+            self._orig_reg_save_path = orig_reg_path
         else:
             msgs.append(f"(no labels found for frame {prev_num})")
 
@@ -407,14 +426,12 @@ the limit before converging (cost still dropping at last iteration).
             min_s = self._min_slice.value()
             max_s = self._max_slice.value()
         else:
-            # auto-detect: first and last Z slice containing any non-zero label
-            has_labels = layer.data.any(axis=(1, 2))
-            nonzero_z = np.where(has_labels)[0]
-            if len(nonzero_z) == 0:
+            # auto-detect: Z extent of the largest connected component
+            result = auto_slice_range(layer.data)
+            if result is None:
                 self.label.setText("No labels found in any slice")
                 return
-            min_s = int(nonzero_z[0])
-            max_s = int(nonzero_z[-1])
+            min_s, max_s = result
             # update spinboxes so the user can see what was computed
             self._min_slice.setValue(min_s)
             self._max_slice.setValue(max_s)
@@ -462,9 +479,16 @@ the limit before converging (cost still dropping at last iteration).
 
         signals = _WorkerSignals()
 
-        def _on_done(warped):
+        def _on_done(result):
+            warped      = result['corrected']
+            warped_orig = result['original']
             self._layer_reg = self.viewer.add_labels(warped, name=name_out)
-            self.label.setText(f"Registration done — '{name_out}' loaded")
+            msg = f"Registration done — '{name_out}' loaded"
+            if warped_orig is not None:
+                orig_name_out = f"original_registered_to_{frame_num}"
+                self._layer_reg_orig = self.viewer.add_labels(warped_orig, name=orig_name_out)
+                msg += f", '{orig_name_out}' loaded"
+            self.label.setText(msg)
             self._btn_reg.setEnabled(True)
 
         def _on_error(exc):
@@ -477,7 +501,9 @@ the limit before converging (cost still dropping at last iteration).
         signals.done.connect(_on_done)
         signals.error.connect(_on_error)
 
-        save_path = self._reg_save_path  # capture before entering thread
+        save_path      = self._reg_save_path        # capture before entering thread
+        orig_save_path = self._orig_reg_save_path
+        prev_orig_path = self._prev_orig_path
 
         def _run():
             try:
@@ -495,12 +521,29 @@ the limit before converging (cost still dropping at last iteration).
                 R = euler_angles_to_rotation_matrix(params[:3])
                 t = params[3:]
                 warped = warp_to_original_space(orig_prev, R, t, reg_res, orig_curr.shape)
+
+                # also warp the original (non-corrected) prev frame with the same transform
+                warped_orig = None
+                if prev_orig_path is not None:
+                    print(f"Warping original (non-corrected) prev frame: {prev_orig_path.name}…",
+                          flush=True)
+                    data_orig = tifffile.imread(str(prev_orig_path)).astype(np.uint32)
+                    _, orig_prev_uncorr, _ = prep_array(data_orig, reg_res)
+                    warped_orig = warp_to_original_space(
+                        orig_prev_uncorr, R, t, reg_res, orig_curr.shape
+                    )
+
                 # save to disk in the background thread — not on the Qt main thread
                 if save_path is not None:
                     print(f"Saving registered frame to {save_path}…", flush=True)
                     tifffile.imwrite(str(save_path), warped)
                     print(f"Saved → {save_path.name}", flush=True)
-                signals.done.emit(warped)
+                if warped_orig is not None and orig_save_path is not None:
+                    print(f"Saving original registered frame to {orig_save_path}…", flush=True)
+                    tifffile.imwrite(str(orig_save_path), warped_orig)
+                    print(f"Saved → {orig_save_path.name}", flush=True)
+
+                signals.done.emit({'corrected': warped, 'original': warped_orig})
             except Exception as exc:
                 signals.error.emit(exc)
 

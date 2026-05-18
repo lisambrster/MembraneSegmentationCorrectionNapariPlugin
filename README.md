@@ -24,6 +24,20 @@ A napari plugin for correcting 3D membrane segmentation label images across time
 
 ## Installation
 
+### Step 1 — install napari with Qt bindings
+
+napari requires a Qt backend (PyQt6 recommended).  Choose **one** of:
+
+```bash
+# conda / miniforge (recommended)
+conda install -c conda-forge napari pyqt6
+
+# pip
+pip install "napari[pyqt6]"
+```
+
+### Step 2 — install this plugin
+
 ```bash
 git clone <repo-url>
 cd NapariPlugin

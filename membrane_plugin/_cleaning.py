@@ -27,3 +27,20 @@ def remove_bad_slices(lab_img, min_slice, max_slice):
     lab_img[:min_slice, :, :] = 0
     lab_img[max_slice + 1:, :, :] = 0
     return lab_img
+
+
+def auto_slice_range(lab_img: np.ndarray) -> tuple[int, int] | None:
+    """Return (min_z, max_z) of the Z extent of the largest connected component.
+
+    Operates on the binary foreground (any label > 0).  Returns None if the
+    image is empty.
+    """
+    cc_img = label(lab_img > 0, connectivity=3)
+    props = regionprops(cc_img)
+    if not props:
+        return None
+    largest = max(props, key=lambda p: p.area)
+    # regionprops bbox is (min_z, min_y, min_x, max_z_excl, max_y_excl, max_x_excl)
+    min_z = largest.bbox[0]
+    max_z = largest.bbox[3] - 1
+    return min_z, max_z

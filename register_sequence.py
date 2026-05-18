@@ -60,18 +60,23 @@ from membrane_plugin._registration import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _find_frame(directory: Path, frame_num: int) -> Path | None:
+def _find_frame(directory: Path, frame_num: int, prefer_corrected: bool = True) -> Path | None:
     candidates = []
     for f in sorted(directory.iterdir()):
         if f.suffix not in ('.tif', '.tiff'):
+            continue
+        if 'registered_to_' in f.name:
             continue
         nums = [int(m.group()) for m in re.finditer(r'\d+', f.name)]
         if frame_num in nums:
             candidates.append(f)
     if not candidates:
         return None
-    corrected = [f for f in candidates if 'corrected' in f.name.lower()]
-    return corrected[0] if corrected else candidates[0]
+    corrected   = [f for f in candidates if 'corrected' in f.name.lower()]
+    uncorrected = [f for f in candidates if 'corrected' not in f.name.lower()]
+    if prefer_corrected:
+        return corrected[0] if corrected else candidates[0]
+    return uncorrected[0] if uncorrected else candidates[0]
 
 
 def _all_frame_numbers(seg_dir: Path) -> list[int]:
@@ -105,6 +110,7 @@ def _clean(img: np.ndarray, min_volume: int | None,
 # ---------------------------------------------------------------------------
 
 def register_pair(prev_path: Path, curr_path: Path,
+                  prev_orig_path: Path | None = None,
                   min_volume: int | None = None,
                   min_slice: int | None = None,
                   max_slice: int | None = None,
@@ -112,8 +118,13 @@ def register_pair(prev_path: Path, curr_path: Path,
                   max_nfev: int = 2000,
                   n_starts: int = 12,
                   angle_perturb: float = 0.1,
-                  trans_perturb: float = 5.0) -> np.ndarray:
-    """Register *prev_path* to *curr_path* and return the warped previous frame."""
+                  trans_perturb: float = 5.0) -> tuple[np.ndarray, np.ndarray | None]:
+    """Register *prev_path* (corrected) to *curr_path* and return warped arrays.
+
+    Returns (warped_corrected, warped_original_or_None).  If *prev_orig_path* is
+    supplied and differs from *prev_path*, the same transform is also applied to
+    the original (non-corrected) frame.
+    """
     print(f"  Loading {prev_path.name}", flush=True)
     prev = tifffile.imread(str(prev_path)).astype(np.uint32)
     print(f"  Loading {curr_path.name}", flush=True)
@@ -136,8 +147,18 @@ def register_pair(prev_path: Path, curr_path: Path,
     )
     R = euler_angles_to_rotation_matrix(params[:3])
     t = params[3:]
-    print("  Warping to original space…", flush=True)
-    return warp_to_original_space(orig_prev, R, t, reg_res, orig_curr.shape)
+    print("  Warping corrected prev to original space…", flush=True)
+    warped = warp_to_original_space(orig_prev, R, t, reg_res, orig_curr.shape)
+
+    warped_orig = None
+    if prev_orig_path is not None and prev_orig_path != prev_path:
+        print(f"  Warping original (non-corrected) prev: {prev_orig_path.name}…", flush=True)
+        orig_data = tifffile.imread(str(prev_orig_path)).astype(np.uint32)
+        orig_data = _clean(orig_data, min_volume, min_slice, max_slice)
+        _, orig_prev_uncorr, _ = prep_array(orig_data, reg_res)
+        warped_orig = warp_to_original_space(orig_prev_uncorr, R, t, reg_res, orig_curr.shape)
+
+    return warped, warped_orig
 
 
 # ---------------------------------------------------------------------------
@@ -205,14 +226,18 @@ def main():
         prev_num = frames[i - 1]
 
         curr_path = _find_frame(seg_dir, curr_num)
-        prev_path = _find_frame(seg_dir, prev_num)
+        prev_path = _find_frame(seg_dir, prev_num)          # corrected preferred
+        prev_orig_path = _find_frame(seg_dir, prev_num, prefer_corrected=False)
+        if prev_orig_path == prev_path:
+            prev_orig_path = None  # no separate original; skip dual warp
 
         if curr_path is None or prev_path is None:
             print(f"[SKIP] frame {prev_num}→{curr_num}: file not found", flush=True)
             n_missing += 1
             continue
 
-        out_path = seg_dir / f"registered_to_{curr_num}{prev_path.suffix}"
+        out_path      = seg_dir / f"registered_to_{curr_num}{prev_path.suffix}"
+        orig_out_path = seg_dir / f"original_registered_to_{curr_num}{prev_path.suffix}"
 
         if args.skip_existing and out_path.exists():
             print(f"[SKIP] frame {prev_num}→{curr_num}: {out_path.name} already exists",
@@ -222,11 +247,14 @@ def main():
 
         print(f"\n{'='*60}", flush=True)
         print(f"Registering frame {prev_num} → frame {curr_num}", flush=True)
+        if prev_orig_path:
+            print(f"  (will also warp original: {prev_orig_path.name})", flush=True)
         print(f"{'='*60}", flush=True)
 
         try:
-            warped = register_pair(
+            warped, warped_orig = register_pair(
                 prev_path, curr_path,
+                prev_orig_path=prev_orig_path,
                 min_volume=args.min_volume,
                 min_slice=args.min_slice,
                 max_slice=args.max_slice,
@@ -237,6 +265,9 @@ def main():
             )
             tifffile.imwrite(str(out_path), warped)
             print(f"  Saved → {out_path.name}", flush=True)
+            if warped_orig is not None:
+                tifffile.imwrite(str(orig_out_path), warped_orig)
+                print(f"  Saved → {orig_out_path.name}", flush=True)
             n_done += 1
         except Exception as exc:
             import traceback
