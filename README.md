@@ -40,9 +40,11 @@ pip install "napari[pyqt6]"
 
 ```bash
 git clone <repo-url>
-cd NapariPlugin
+cd MembraneSegmentationCorrectionNapariPlugin
 pip install -e .
 ```
+
+To update an existing install after `git pull`, always re-run `pip install -e .` — entry points are registered at install time and won't update otherwise.
 
 Then launch napari and find **Membrane Segmentation Correction** under *Plugins*.
 
