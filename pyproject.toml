@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=45"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "membrane-segmentation-correction"
+version = "0.1.0"
+description = "Napari plugin for correcting 3D membrane segmentation across time frames"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "napari>=0.4.18",
+    "tifffile",
+    "numpy",
+    "scipy",
+    "scikit-image",
+    "qtpy",
+]
+
+[project.optional-dependencies]
+fast = ["numba"]   # speeds up label-overlap computation in paircheck
+
+[project.entry-points."napari.manifest"]
+membrane_plugin = "membrane_plugin:napari.yaml"
+
+[project.scripts]
+register-sequence = "register_sequence:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["membrane_plugin*"]
+
+[tool.setuptools.package-data]
+membrane_plugin = ["napari.yaml"]
