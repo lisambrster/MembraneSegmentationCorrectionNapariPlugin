@@ -1,0 +1,28 @@
+###YAML config file for image segmentation, registration and lineage tracking
+
+# if you don't have the graph - just don't put these two lines
+graph_path: '/mnt/ceph/users/mousedata/Niv_Masha_Lisa/260206/stack_5/Tracking/'
+graph_name: 'MembraneLineageGraph.json'
+
+membrane_path: '/mnt/ceph/users/mousedata/Niv_Masha_Lisa/260206/stack_5/Raw_data/membrane/Cam_long_%05d.crop.tif'
+membrane_label_path: '/mnt/ceph/users/mousedata/Niv_Masha_Lisa/260206/stack_5/membrane_segmentation/Cam_long_%05d.crop_seg.tif'
+alt_membrane_label_path: '/mnt/ceph/users/mousedata/Niv_Masha_Lisa/260206/stack_5/membrane_segmentation/Cam_long_%05d.crop_seg_corrected.tif'
+
+#membrane_label_path: '/mnt/ceph/users/mousedata/Niv_Masha_Lisa/260206/stack_2/membrane_segmentation_subset/Cam_long_%05d.crop_seg.tif'
+#alt_membrane_label_path: '/mnt/ceph/users/mousedata/Niv_Masha_Lisa/260206/stack_2/membrane_segmentation_subset/Cam_long_%05d.crop_seg.tif'
+
+#nuc_label_path:
+nuc_path: '/mnt/ceph/users/mousedata/Niv_Masha_Lisa/260206/stack_5/Raw_data/nuclei/Cam_long_%05d.crop.tif'
+# Output Directory - location of segmentation, registration, IoU table, and lineage graph
+output_path: '//mnt/ceph/users/mousedata/Niv_Masha_Lisa/260206/stack_5/'
+
+# reg_res increase z this many times, reduce x/y br reg_res/10
+reg_res: 2
+
+register_begin_frame: 0 #
+register_end_frame: 99 #
+register_file_name_prefix: membrane # not used
+marker_size: 5
+marker_font_size: 10
+
+#
