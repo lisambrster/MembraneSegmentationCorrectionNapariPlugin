@@ -1,17 +1,19 @@
 """
 register_sequence.py
 --------------------
-Optionally clean, then register each previous frame to its successor
-across an entire membrane_segmentation directory.
+Optionally clean, then register frames across an entire membrane_segmentation
+directory.  Two modes are supported:
 
-For every consecutive pair (frame N-1, frame N) the script:
-  1. Loads both label tiffs (preferring *_corrected* variants).
-  2. Optionally runs prep (remove small objects) on each frame.
-  3. Optionally runs remove_bad_slices on each frame.
-  4. Skips the pair if <prev_stem>_registered.tif already exists.
-  5. Runs multi-start rigid registration (prev → curr).
-  6. Saves the warped previous frame as <prev_stem>_registered.tif
-     in the same membrane_segmentation directory.
+  Consecutive (default):
+    Register each previous frame to its successor.  For every pair
+    (frame N-1, frame N) the warped previous frame is saved as
+    registered_to_<N>.tif.
+
+  Anchor (--anchor first | --anchor last):
+    Register all frames to a single reference frame — either the first
+    or the last frame in the sequence.  Each moving frame M is saved as
+    <M>_registered_to_<ref>.tif.  By default the first frame is used as
+    the anchor.
 
 Usage
 -----
@@ -24,7 +26,10 @@ Options
 -------
   --start N            first frame number to process (default: auto)
   --end N              last frame number to process  (default: auto)
-  --skip-existing      skip pairs whose registered file already exists (default)
+  --anchor {first,last}
+                       switch to anchor mode: register all frames to the
+                       first (default) or last frame in the sequence
+  --skip-existing      skip frames whose registered file already exists (default)
   --no-skip-existing   re-run registration even if output file exists
 
   Cleaning (applied to every frame before registration):
@@ -175,9 +180,13 @@ def main():
                         help="First frame number to process")
     parser.add_argument("--end", type=int, default=None,
                         help="Last frame number to process")
+    parser.add_argument("--anchor", choices=["first", "last"], default=None,
+                        metavar="{first,last}",
+                        help="Anchor mode: register all frames to the first (default) "
+                             "or last frame.  Omit to use consecutive-pair mode.")
     parser.add_argument("--skip-existing", dest="skip_existing",
                         action="store_true", default=True,
-                        help="Skip pairs whose registered file already exists (default)")
+                        help="Skip frames whose registered file already exists (default)")
     parser.add_argument("--no-skip-existing", dest="skip_existing",
                         action="store_false",
                         help="Re-run registration even if output already exists")
@@ -221,58 +230,125 @@ def main():
 
     n_done = n_skipped = n_missing = 0
 
-    for i in range(1, len(frames)):
-        curr_num = frames[i]
-        prev_num = frames[i - 1]
+    if args.anchor is not None:
+        # ---------------------------------------------------------------
+        # Anchor mode: register all frames to a single reference frame
+        # ---------------------------------------------------------------
+        ref_num = frames[0] if args.anchor == "first" else frames[-1]
+        moving_frames = [n for n in frames if n != ref_num]
 
-        curr_path = _find_frame(seg_dir, curr_num)
-        prev_path = _find_frame(seg_dir, prev_num)          # corrected preferred
-        prev_orig_path = _find_frame(seg_dir, prev_num, prefer_corrected=False)
-        if prev_orig_path == prev_path:
-            prev_orig_path = None  # no separate original; skip dual warp
+        print(f"Anchor mode: reference = frame {ref_num}  "
+              f"({len(moving_frames)} frames to register)")
 
-        if curr_path is None or prev_path is None:
-            print(f"[SKIP] frame {prev_num}→{curr_num}: file not found", flush=True)
-            n_missing += 1
-            continue
+        ref_path = _find_frame(seg_dir, ref_num)
+        if ref_path is None:
+            sys.exit(f"ERROR: reference frame {ref_num} not found in {seg_dir}")
 
-        out_path      = seg_dir / f"registered_to_{curr_num}{prev_path.suffix}"
-        orig_out_path = seg_dir / f"original_registered_to_{curr_num}{prev_path.suffix}"
+        print(f"Loading reference frame {ref_num}: {ref_path.name}", flush=True)
+        ref_img = tifffile.imread(str(ref_path)).astype(np.uint32)
+        ref_img = _clean(ref_img, args.min_volume, args.min_slice, args.max_slice)
 
-        if args.skip_existing and out_path.exists():
-            print(f"[SKIP] frame {prev_num}→{curr_num}: {out_path.name} already exists",
-                  flush=True)
-            n_skipped += 1
-            continue
+        bnd_ref, orig_ref, _ = prep_array(ref_img, 2)
 
-        print(f"\n{'='*60}", flush=True)
-        print(f"Registering frame {prev_num} → frame {curr_num}", flush=True)
-        if prev_orig_path:
-            print(f"  (will also warp original: {prev_orig_path.name})", flush=True)
-        print(f"{'='*60}", flush=True)
+        for frame_num in moving_frames:
+            out_path = seg_dir / f"{frame_num}_registered_to_{ref_num}{ref_path.suffix}"
 
-        try:
-            warped, warped_orig = register_pair(
-                prev_path, curr_path,
-                prev_orig_path=prev_orig_path,
-                min_volume=args.min_volume,
-                min_slice=args.min_slice,
-                max_slice=args.max_slice,
-                max_nfev=args.max_nfev,
-                n_starts=args.n_starts,
-                angle_perturb=args.angle_perturb,
-                trans_perturb=args.trans_perturb,
-            )
-            tifffile.imwrite(str(out_path), warped)
-            print(f"  Saved → {out_path.name}", flush=True)
-            if warped_orig is not None:
-                tifffile.imwrite(str(orig_out_path), warped_orig)
-                print(f"  Saved → {orig_out_path.name}", flush=True)
-            n_done += 1
-        except Exception as exc:
-            import traceback
-            print(f"  ERROR: {exc}", flush=True)
-            traceback.print_exc()
+            if args.skip_existing and out_path.exists():
+                print(f"[SKIP] frame {frame_num}: {out_path.name} already exists",
+                      flush=True)
+                n_skipped += 1
+                continue
+
+            frame_path = _find_frame(seg_dir, frame_num)
+            if frame_path is None:
+                print(f"[MISS] frame {frame_num}: file not found", flush=True)
+                n_missing += 1
+                continue
+
+            print(f"\n{'='*60}", flush=True)
+            print(f"Registering frame {frame_num} → reference frame {ref_num}", flush=True)
+            print(f"{'='*60}", flush=True)
+
+            try:
+                print(f"  Loading {frame_path.name}", flush=True)
+                frame_img = tifffile.imread(str(frame_path)).astype(np.uint32)
+                frame_img = _clean(frame_img, args.min_volume, args.min_slice, args.max_slice)
+
+                bnd_frame, orig_frame, _ = prep_array(frame_img, 2)
+                params = register_multiscale(
+                    bnd_frame.astype(np.float32), bnd_ref.astype(np.float32), np.zeros(6),
+                    max_nfev=args.max_nfev,
+                    n_random_starts=args.n_starts,
+                    angle_perturb=args.angle_perturb,
+                    translation_perturb=args.trans_perturb,
+                )
+                R = euler_angles_to_rotation_matrix(params[:3])
+                t = params[3:]
+                warped = warp_to_original_space(orig_frame, R, t, 2, orig_ref.shape)
+                tifffile.imwrite(str(out_path), warped)
+                print(f"  Saved → {out_path.name}", flush=True)
+                n_done += 1
+            except Exception as exc:
+                import traceback
+                print(f"  ERROR: {exc}", flush=True)
+                traceback.print_exc()
+
+    else:
+        # ---------------------------------------------------------------
+        # Consecutive-pair mode (original behaviour)
+        # ---------------------------------------------------------------
+        for i in range(1, len(frames)):
+            curr_num = frames[i]
+            prev_num = frames[i - 1]
+
+            curr_path = _find_frame(seg_dir, curr_num)
+            prev_path = _find_frame(seg_dir, prev_num)          # corrected preferred
+            prev_orig_path = _find_frame(seg_dir, prev_num, prefer_corrected=False)
+            if prev_orig_path == prev_path:
+                prev_orig_path = None  # no separate original; skip dual warp
+
+            if curr_path is None or prev_path is None:
+                print(f"[SKIP] frame {prev_num}→{curr_num}: file not found", flush=True)
+                n_missing += 1
+                continue
+
+            out_path      = seg_dir / f"registered_to_{curr_num}{prev_path.suffix}"
+            orig_out_path = seg_dir / f"original_registered_to_{curr_num}{prev_path.suffix}"
+
+            if args.skip_existing and out_path.exists():
+                print(f"[SKIP] frame {prev_num}→{curr_num}: {out_path.name} already exists",
+                      flush=True)
+                n_skipped += 1
+                continue
+
+            print(f"\n{'='*60}", flush=True)
+            print(f"Registering frame {prev_num} → frame {curr_num}", flush=True)
+            if prev_orig_path:
+                print(f"  (will also warp original: {prev_orig_path.name})", flush=True)
+            print(f"{'='*60}", flush=True)
+
+            try:
+                warped, warped_orig = register_pair(
+                    prev_path, curr_path,
+                    prev_orig_path=prev_orig_path,
+                    min_volume=args.min_volume,
+                    min_slice=args.min_slice,
+                    max_slice=args.max_slice,
+                    max_nfev=args.max_nfev,
+                    n_starts=args.n_starts,
+                    angle_perturb=args.angle_perturb,
+                    trans_perturb=args.trans_perturb,
+                )
+                tifffile.imwrite(str(out_path), warped)
+                print(f"  Saved → {out_path.name}", flush=True)
+                if warped_orig is not None:
+                    tifffile.imwrite(str(orig_out_path), warped_orig)
+                    print(f"  Saved → {orig_out_path.name}", flush=True)
+                n_done += 1
+            except Exception as exc:
+                import traceback
+                print(f"  ERROR: {exc}", flush=True)
+                traceback.print_exc()
 
     print(f"\nDone.  registered={n_done}  skipped={n_skipped}  missing={n_missing}")
 

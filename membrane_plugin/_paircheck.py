@@ -2,189 +2,141 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 
 # ---------------------------------------------------------------------------
-# Inlined matching utilities (from stardist/csbdeep matching.py)
-# csbdeep removed as a dependency; numba is optional
-# ---------------------------------------------------------------------------
-
-def _raise(err):
-    raise err
-
-
-def is_array_of_integers(y):
-    return isinstance(y, np.ndarray) and np.issubdtype(y.dtype, np.integer)
-
-
-def label_are_sequential(y):
-    labels = np.unique(y)
-    return (set(labels) - {0}) == set(range(1, 1 + labels.max()))
-
-
-def _check_label_array(y, name=None, check_sequential=False):
-    err = ValueError("{label} must be an array of {integers}.".format(
-        label='labels' if name is None else name,
-        integers=('sequential ' if check_sequential else '') + 'non-negative integers',
-    ))
-    is_array_of_integers(y) or _raise(err)
-    if len(y) == 0:
-        return True
-    if check_sequential:
-        label_are_sequential(y) or _raise(err)
-    else:
-        y.min() >= 0 or _raise(err)
-    return True
-
-
-def _label_overlap_numpy(x, y):
-    x = x.ravel()
-    y = y.ravel()
-    overlap = np.zeros((1 + int(x.max()), 1 + int(y.max())), dtype=np.uint64)
-    np.add.at(overlap, (x, y), 1)
-    return overlap
-
-
-try:
-    from numba import jit as _numba_jit
-
-    @_numba_jit(nopython=True)
-    def _label_overlap_numba(x, y):
-        x = x.ravel()
-        y = y.ravel()
-        overlap = np.zeros((1 + x.max(), 1 + y.max()), dtype=np.uint64)
-        for i in range(len(x)):
-            overlap[x[i], y[i]] += 1
-        return overlap
-
-    _label_overlap = _label_overlap_numba
-except Exception:
-    _label_overlap = _label_overlap_numpy
-
-
-def label_overlap(x, y, check=True):
-    if check:
-        _check_label_array(x, 'x', True)
-        _check_label_array(y, 'y', True)
-        x.shape == y.shape or _raise(ValueError("x and y must have the same shape"))
-    return _label_overlap(x, y)
-
-
-def _safe_divide(x, y, eps=1e-10):
-    if np.isscalar(x) and np.isscalar(y):
-        return x / y if np.abs(y) > eps else 0.0
-    else:
-        out = np.zeros(np.broadcast(x, y).shape, np.float32)
-        np.divide(x, y, out=out, where=np.abs(y) > eps)
-        return out
-
-
-def intersection_over_union(overlap):
-    if np.sum(overlap) == 0:
-        return overlap
-    n_pixels_pred = np.sum(overlap, axis=0, keepdims=True)
-    n_pixels_true = np.sum(overlap, axis=1, keepdims=True)
-    return _safe_divide(overlap, (n_pixels_pred + n_pixels_true - overlap))
-
-
-def relabel_sequential(label_field, offset=1):
-    offset = int(offset)
-    if offset <= 0:
-        raise ValueError("Offset must be strictly positive.")
-    if np.min(label_field) < 0:
-        raise ValueError("Cannot relabel array that contains negative values.")
-    max_label = int(label_field.max())
-    if not np.issubdtype(label_field.dtype, np.integer):
-        new_type = np.min_scalar_type(max_label)
-        label_field = label_field.astype(new_type)
-    labels = np.unique(label_field)
-    labels0 = labels[labels != 0]
-    new_max_label = offset - 1 + len(labels0)
-    new_labels0 = np.arange(offset, new_max_label + 1)
-    output_type = label_field.dtype
-    required_type = np.min_scalar_type(new_max_label)
-    if np.dtype(required_type).itemsize > np.dtype(label_field.dtype).itemsize:
-        output_type = required_type
-    forward_map = np.zeros(max_label + 1, dtype=output_type)
-    forward_map[labels0] = new_labels0
-    inverse_map = np.zeros(new_max_label + 1, dtype=output_type)
-    inverse_map[offset:] = labels0
-    relabeled = forward_map[label_field]
-    return relabeled, forward_map, inverse_map
-
-
-def _matching(y_true, y_pred, thresh=0.5, criterion='iou'):
-    """Returns (scores, map_rev_true, map_rev_pred) — the IoU table and label maps."""
-    _check_label_array(y_true, 'y_true')
-    _check_label_array(y_pred, 'y_pred')
-    if y_true.shape != y_pred.shape:
-        raise ValueError("y_true and y_pred have different shapes")
-    if thresh is None:
-        thresh = 0
-
-    y_true, _, map_rev_true = relabel_sequential(y_true)
-    y_pred, _, map_rev_pred = relabel_sequential(y_pred)
-
-    overlap = label_overlap(y_true, y_pred, check=False)
-    scores = intersection_over_union(overlap)
-    return scores, map_rev_true, map_rev_pred
-
-
-# ---------------------------------------------------------------------------
 # Core check
 # ---------------------------------------------------------------------------
+#
+# Every cell on both sides of the pair is explained by one of:
+#   prev (mother) side: exactly one significant daughter (normal), no
+#     significant daughter at all (cells_with_no_daughter), or 2+ significant
+#     daughters (a split -- see below for how that's further classified)
+#   curr (daughter) side: exactly one significant mother (normal), no
+#     significant mother at all (new_cells -- unexplained/new), or 2+
+#     significant mothers (daughter_with_two_mothers -- a merge)
+#
+# "Significant" here means Io2 (intersection-over-prediction, i.e.
+# intersection / that label's OWN volume) >= io2_thresh -- same metric this
+# project's Io2Table/ComputeIo2TableFromTransforms.py use elsewhere, chosen
+# over plain IoU because it correctly separates "this daughter is mostly
+# explained by this mother" from "this mother happens to be huge", which
+# plain IoU conflates.
+#
+# A split (mother with 2+ significant daughters) is further split into:
+#   bad_splits -- one daughter's volume is close to the mother's own volume
+#     (BAD_SPLIT_DOMINANT_RANGE) while every other daughter is either much
+#     smaller (BAD_SPLIT_WEAK_VOL_RATIO) or weakly attached
+#     (BAD_SPLIT_WEAK_IO2) -- the signature of a spurious fragment getting
+#     cut off a cell that didn't actually divide, not a real division.
+#   splits -- everything else (daughters comparably sized/attached -- reads
+#     as a genuine division candidate).
 
-def check_frame_pair(img_prev, img_curr, iou_thresh=0.75):
+IO2_THRESH               = 0.15
+BAD_SPLIT_DOMINANT_RANGE = (0.8, 1.25)
+BAD_SPLIT_WEAK_VOL_RATIO = 0.5
+BAD_SPLIT_WEAK_IO2       = 0.35
+
+
+def _label_overlap_matrix(img_prev, img_curr):
+    """overlap[m, d] = voxel count where img_prev==m and img_curr==d (0 included)."""
+    flat_prev = img_prev.ravel().astype(np.int64)
+    flat_curr = img_curr.ravel().astype(np.int64)
+    max_prev = int(flat_prev.max())
+    max_curr = int(flat_curr.max())
+    combined = flat_prev * (max_curr + 1) + flat_curr
+    counts = np.bincount(combined, minlength=(max_prev + 1) * (max_curr + 1))
+    return counts.reshape(max_prev + 1, max_curr + 1)
+
+
+def check_frame_pair(img_prev, img_curr, io2_thresh=IO2_THRESH):
     """
-    Compare two label frames and find segmentation inconsistencies.
+    Compare two label frames and explain every cell on both sides.
 
     Parameters
     ----------
     img_prev : (Z,Y,X) uint label — registered previous frame
     img_curr : (Z,Y,X) uint label — current frame
-    iou_thresh : IoU threshold passed to matching (default 0.75)
+    io2_thresh : minimum Io2 (intersection / that label's own volume) to
+        count as a significant match (default 0.15)
 
     Returns
     -------
     dict with keys:
         n_prev, n_curr              — cell counts
-        daughter_with_two_mothers   — list of [daughter_id, [[mother_id, iou], ...]]
-        cells_with_no_daughter      — list of cell ids
-        cells_with_two_daughters    — list of cell ids
+        cells_with_no_daughter      — mother ids with no significant daughter
+        new_cells                   — daughter ids with no significant mother
+        daughter_with_two_mothers   — [daughter_id, [(mother_id, io2, mother_vol), ...]]
+            (a merge: two prev cells both explain this one daughter)
+        splits                      — [mother_id, [(daughter_id, io2, daughter_vol), ...]]
+            (mother has 2+ significant daughters, roughly balanced — likely
+            a real division)
+        bad_splits                  — same shape as splits, but one daughter
+            ~ the mother's own size and the rest are small/weak — likely a
+            spurious fragment, not a real division
     """
-    IoUTable, lab1, lab2 = _matching(img_prev, img_curr, thresh=iou_thresh)
+    labels_prev = sorted(int(l) for l in np.unique(img_prev) if l != 0)
+    labels_curr = sorted(int(l) for l in np.unique(img_curr) if l != 0)
 
-    cell_list = list(lab1)
-    next_list = list(lab2)
+    overlap = _label_overlap_matrix(img_prev, img_curr)
 
-    DaughterToMother   = {}
-    cells_no_daughter  = []
-    cells_two_daughter = []
+    vol_prev = {m: int(overlap[m, :].sum()) for m in labels_prev}
+    vol_curr = {d: int(overlap[:, d].sum()) for d in labels_curr}
 
-    for ilab in range(1, len(lab1)):          # skip 0 (background)
-        ilab_id = cell_list[ilab]
-        row     = IoUTable[ilab]
+    # mother -> significant daughters: Io2 = overlap / daughter's own volume
+    mother_daughters = {}
+    for m in labels_prev:
+        sig = []
+        for d in labels_curr:
+            ov = int(overlap[m, d])
+            if ov == 0:
+                continue
+            io2 = ov / vol_curr[d]
+            if io2 >= io2_thresh:
+                sig.append((d, io2, vol_curr[d]))
+        mother_daughters[m] = sorted(sig, key=lambda x: -x[1])
 
-        if np.max(row) < 0.2:
-            cells_no_daughter.append(int(ilab_id))
-            continue
+    # daughter -> significant mothers: Io2 = overlap / mother's own volume
+    daughter_mothers = {}
+    for d in labels_curr:
+        sig = []
+        for m in labels_prev:
+            ov = int(overlap[m, d])
+            if ov == 0:
+                continue
+            io2 = ov / vol_prev[m]
+            if io2 >= io2_thresh:
+                sig.append((m, io2, vol_prev[m]))
+        daughter_mothers[d] = sorted(sig, key=lambda x: -x[1])
 
-        daughter_id = int(next_list[np.argmax(row)])
-        iou         = float(np.max(row))
-        DaughterToMother.setdefault(daughter_id, []).append((int(ilab_id), iou))
-
-        if np.sum(row[1:]) > 1.2:
-            cells_two_daughter.append(int(ilab_id))
+    cells_no_daughter = [m for m in labels_prev if not mother_daughters[m]]
+    new_cells         = [d for d in labels_curr if not daughter_mothers[d]]
 
     daughter_with_two_mothers = [
-        [d, mothers]
-        for d, mothers in DaughterToMother.items()
-        if len(mothers) > 1
+        [d, mothers] for d, mothers in daughter_mothers.items() if len(mothers) > 1
     ]
 
+    splits, bad_splits = [], []
+    for m, daughters in mother_daughters.items():
+        if len(daughters) < 2:
+            continue
+        mvol = vol_prev[m]
+        dominant_ratio = (daughters[0][2] / mvol) if mvol else 0.0
+        rest_weak = all(
+            (dvol / mvol < BAD_SPLIT_WEAK_VOL_RATIO) or (io2 < BAD_SPLIT_WEAK_IO2)
+            for _, io2, dvol in daughters[1:]
+        )
+        entry = [m, daughters]
+        if BAD_SPLIT_DOMINANT_RANGE[0] <= dominant_ratio <= BAD_SPLIT_DOMINANT_RANGE[1] and rest_weak:
+            bad_splits.append(entry)
+        else:
+            splits.append(entry)
+
     return {
-        'n_prev':                   len(lab1) - 1,
-        'n_curr':                   len(lab2) - 1,
-        'daughter_with_two_mothers': daughter_with_two_mothers,
+        'n_prev':                   len(labels_prev),
+        'n_curr':                   len(labels_curr),
         'cells_with_no_daughter':   cells_no_daughter,
-        'cells_with_two_daughters': cells_two_daughter,
+        'new_cells':                new_cells,
+        'daughter_with_two_mothers': daughter_with_two_mothers,
+        'splits':                   splits,
+        'bad_splits':               bad_splits,
     }
 
 
@@ -192,25 +144,39 @@ def summary_text(result: dict) -> str:
     lines = [
         f"Prev cells : {result['n_prev']}",
         f"Curr cells : {result['n_curr']}",
-        f"Daughters with 2 mothers : {len(result['daughter_with_two_mothers'])}",
-        f"Cells with no daughter   : {len(result['cells_with_no_daughter'])}",
-        f"Cells with 2 daughters   : {len(result['cells_with_two_daughters'])}",
+        f"No daughter (cell disappeared) : {len(result['cells_with_no_daughter'])}",
+        f"New/unexplained cells          : {len(result['new_cells'])}",
+        f"Merges (daughter <- 2+ mothers) : {len(result['daughter_with_two_mothers'])}",
+        f"Splits (likely real division)   : {len(result['splits'])}",
+        f"BAD splits (likely seg error)   : {len(result['bad_splits'])}",
     ]
+    if result['bad_splits']:
+        lines.append("")
+        lines.append("BAD splits:")
+        for m, daughters in result['bad_splits']:
+            dstr = ', '.join(f'{d}(io2={io2:.2f},vol={vol})' for d, io2, vol in daughters)
+            lines.append(f"  mother {m} -> {dstr}")
+    if result['splits']:
+        lines.append("")
+        lines.append("Splits:")
+        for m, daughters in result['splits']:
+            dstr = ', '.join(f'{d}(io2={io2:.2f},vol={vol})' for d, io2, vol in daughters)
+            lines.append(f"  mother {m} -> {dstr}")
     if result['daughter_with_two_mothers']:
         lines.append("")
-        lines.append("Daughters with 2 mothers:")
+        lines.append("Merges:")
         for d_id, mothers in result['daughter_with_two_mothers']:
-            mothers_str = ', '.join(f'{m}(iou={v:.2f})' for m, v in mothers)
+            mothers_str = ', '.join(f'{m}(io2={io2:.2f},vol={vol})' for m, io2, vol in mothers)
             lines.append(f"  daughter {d_id} <- [{mothers_str}]")
     if result['cells_with_no_daughter']:
         lines.append(f"No daughter: {result['cells_with_no_daughter']}")
-    if result['cells_with_two_daughters']:
-        lines.append(f"Two daughters: {result['cells_with_two_daughters']}")
+    if result['new_cells']:
+        lines.append(f"New/unexplained: {result['new_cells']}")
     return '\n'.join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Fix: smooth Gaussian-field split
+# Fix: smooth Gaussian-field split (merges -- daughter_with_two_mothers)
 # ---------------------------------------------------------------------------
 
 def _smooth_split(lab_mother, mother_ids, d_idx, image_shape, sigma=10):
@@ -254,8 +220,8 @@ def fix_seg_errors(lab_mother, lab_daughter, check_result, sigma=10):
     next_label   = int(lab_daughter.max()) + 1
     n_fixed      = 0
 
-    for daughter_id, mothers_with_iou in check_result['daughter_with_two_mothers']:
-        mother_ids = [m[0] for m in mothers_with_iou]
+    for daughter_id, mothers in check_result['daughter_with_two_mothers']:
+        mother_ids = [m[0] for m in mothers]
         d_idx = np.where(lab_daughter == daughter_id)
         if len(d_idx[0]) == 0:
             print(f'  daughter {daughter_id} not found — skipping')
