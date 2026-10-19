@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import re
 import numpy as np
 import tifffile
@@ -15,10 +16,7 @@ from qtpy.QtWidgets import (
 import napari
 from napari.qt import thread_worker
 from membrane_plugin._cleaning import prep, remove_bad_slices, auto_slice_range
-from membrane_plugin._registration import (
-    prep_array, register_multiscale,
-    euler_angles_to_rotation_matrix, warp_to_original_space,
-)
+from membrane_plugin._registration import warp_to_original_space
 from membrane_plugin._paircheck import check_frame_pair, fix_seg_errors, summary_text
 from membrane_plugin._monotonic import monotonic_keep_sets, apply_keep, summarise
 
@@ -355,41 +353,6 @@ class _CollapsiblePanel(QWidget):
         self._body.setVisible(checked)
 
 
-class _CollapsibleSection(QWidget):
-    """A titled section that folds its rows away.
-
-    The panel is ~1050 px tall and a napari dock rarely gets that much, so
-    the search parameters - which are set once and then left alone - start
-    folded. Nothing is removed; the arrow expands them again.
-    """
-
-    def __init__(self, title: str, inner_layout, expanded=False, parent=None):
-        super().__init__(parent)
-        self._toggle = QToolButton()
-        self._toggle.setText(title)
-        self._toggle.setCheckable(True)
-        self._toggle.setChecked(expanded)
-        self._toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
-        self._toggle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self._toggle.clicked.connect(self._on_toggle)
-
-        self._body = QWidget()
-        self._body.setLayout(inner_layout)
-        self._body.setVisible(expanded)
-
-        lay = QVBoxLayout()
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(2)
-        lay.addWidget(self._toggle)
-        lay.addWidget(self._body)
-        self.setLayout(lay)
-
-    def _on_toggle(self, checked: bool):
-        self._body.setVisible(checked)
-        self._toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
-
-
 class TiffReaderWidget(QWidget):
     def __init__(self, viewer: napari.Viewer):
         super().__init__()
@@ -445,9 +408,6 @@ class TiffReaderWidget(QWidget):
 
         btn_load_final_xform = QPushButton("Load Final Registration Transforms")
         btn_load_final_xform.clicked.connect(self._load_final_transforms)
-        self._btn_unload_final_xform = QPushButton("Unload (use search-based registration)")
-        self._btn_unload_final_xform.clicked.connect(self._unload_final_transforms)
-        self._btn_unload_final_xform.setEnabled(False)
 
         self._btn_res = QPushButton("Set resolution (10, 1, 1)")
         self._btn_res.clicked.connect(self._toggle_resolution)
@@ -591,76 +551,10 @@ class TiffReaderWidget(QWidget):
 
         _REG_RES = 2  # fixed internally
 
-        starts_row = QHBoxLayout()
-        starts_row.addWidget(QLabel("N random starts:"))
-        self._n_starts = QSpinBox()
-        self._n_starts.setRange(0, 50)
-        self._n_starts.setValue(12)
-        starts_row.addWidget(self._n_starts)
-
-        nfev_row = QHBoxLayout()
-        nfev_row.addWidget(QLabel("Max iters:"))
-        self._max_nfev = QSpinBox()
-        self._max_nfev.setRange(100, 50000)
-        self._max_nfev.setValue(2000)
-        self._max_nfev.setSingleStep(500)
-        nfev_row.addWidget(self._max_nfev)
-
-        perturb_row = QHBoxLayout()
-        perturb_row.addWidget(QLabel("Angle perturb (rad):"))
-        self._angle_perturb = QDoubleSpinBox()
-        self._angle_perturb.setRange(0.01, 3.14)
-        self._angle_perturb.setValue(0.1)
-        self._angle_perturb.setSingleStep(0.05)
-        self._angle_perturb.setDecimals(2)
-        perturb_row.addWidget(self._angle_perturb)
-
-        trans_row = QHBoxLayout()
-        trans_row.addWidget(QLabel("Trans perturb (px):"))
-        self._trans_perturb = QDoubleSpinBox()
-        self._trans_perturb.setRange(0.0, 500.0)
-        self._trans_perturb.setValue(5.0)
-        self._trans_perturb.setSingleStep(5.0)
-        self._trans_perturb.setDecimals(1)
-        trans_row.addWidget(self._trans_perturb)
-
-        tips = _CollapsiblePanel("Registration guide", """
-<b>Load Final Registration Transforms</b> — load a precomputed per-frame<br>
-transforms JSON (e.g. RegisteredTransforms_iso0p832um_...json). While<br>
-loaded, the Register button below uses the transform for the current<br>
-pair directly instead of searching, and the previous frame is read<br>
-straight from disk if it isn't already loaded.<br><br>
-<b>Unload (use search-based registration)</b> — discard the loaded<br>
-transforms and go back to letting Register run its own from-scratch<br>
-optimization (register_multiscale) using the parameters below.<br><br>
-<b>Register frame N-1 → N</b> — register the previous frame onto the<br>
-currently loaded frame: uses the loaded transforms if present and they<br>
-cover this pair, otherwise runs the search below.<br><br>
-<b>Register All</b> — batch-register every frame found in the current<br>
-Path directory to a single reference frame (first or last, via the<br>
-"to last frame" checkbox), always via the from-scratch search — it<br>
-does not use loaded final transforms.<br><br>
-<hr>
-<b>N random starts</b> — increase first if registration looks wrong.<br>
-Try 8–16 for difficult cases.<br><br>
-<b>Angle perturb (rad)</b> — widen if there is large rotation between<br>
-frames. Try 0.3–0.5 rad (~17–29°).<br><br>
-<b>Trans perturb (px)</b> — widen if there is large translation between<br>
-frames. Try 20–50 px.<br><br>
-<b>Max iters</b> — increase if the console shows the optimizer hitting<br>
-the limit before converging (cost still dropping at last iteration).
-""")
-
-        self._btn_reg = QPushButton("")
-        self._btn_reg.clicked.connect(self._run_registration)
-        self._frame_spin.valueChanged.connect(self._update_reg_label)
-        self._update_reg_label(self._frame_spin.value())
-
         layout.addLayout(path_row)
         layout.addLayout(frame_row)
         layout.addLayout(final_xform_row)
         layout.addWidget(btn_load_final_xform)
-        layout.addWidget(self._btn_unload_final_xform)
         layout.addWidget(self._btn_res)
         layout.addLayout(min_vol_row)
         layout.addWidget(btn_prep)
@@ -671,14 +565,8 @@ the limit before converging (cost still dropping at last iteration).
         layout.addLayout(slice_row)
         layout.addWidget(self._btn_rbs)
 
-        reg_params = QVBoxLayout()
-        reg_params.setContentsMargins(8, 0, 0, 0)
-        reg_params.addLayout(starts_row)
-        reg_params.addLayout(nfev_row)
-        reg_params.addLayout(perturb_row)
-        reg_params.addLayout(trans_row)
-        reg_params.addWidget(tips)
-        layout.addWidget(_CollapsibleSection("Registration search settings", reg_params))
+        self._btn_reg = QPushButton("")
+        self._btn_reg.clicked.connect(self._run_registration)
         layout.addWidget(self._btn_reg)
 
         reg_all_row = QHBoxLayout()
@@ -712,6 +600,27 @@ the limit before converging (cost still dropping at last iteration).
         self._results.setMaximumHeight(140)
         self._results.setPlaceholderText("Check results will appear here…")
 
+        io2_row = QHBoxLayout()
+        self._btn_io2 = QPushButton("Update Io2 table (this frame)")
+        self._btn_io2.setToolTip(
+            "Recompute only the pairs this frame takes part in and merge them\n"
+            "into the Io2 table beside the loaded transforms. Correcting frame\n"
+            "F invalidates pairs F-1 and F and nothing else."
+        )
+        self._btn_io2.clicked.connect(self._run_update_io2)
+        io2_row.addWidget(self._btn_io2)
+        io2_row.addWidget(QLabel("min size"))
+        self._io2_min_size = QSpinBox()
+        self._io2_min_size.setRange(1, 100000)
+        self._io2_min_size.setValue(1)
+        self._io2_min_size.setFixedWidth(70)
+        self._io2_min_size.setToolTip(
+            "Small-object filter applied before matching. 1 = none, which is\n"
+            "right when the segmentation has already been cleaned."
+        )
+        io2_row.addWidget(self._io2_min_size)
+
+        layout.addLayout(io2_row)
         layout.addWidget(btn_check)
         layout.addLayout(sigma_row)
         layout.addWidget(self._btn_fix)
@@ -811,17 +720,11 @@ the limit before converging (cost still dropping at last iteration).
         self._final_transforms = data
         self._config["final_xform_path"] = str(path)
         _save_config(self._config)
-        self._btn_unload_final_xform.setEnabled(True)
         self.label.setText(
             f"Final registration transforms loaded: {path.name}\n"
             f"  {n_frames} frames, resolution_um={data.get('resolution_um')}\n"
             f"  Register button will now use these transforms directly."
         )
-
-    def _unload_final_transforms(self):
-        self._final_transforms = None
-        self._btn_unload_final_xform.setEnabled(False)
-        self.label.setText("Final registration transforms unloaded — Register button will search from scratch again")
 
     def _load_frame(self):
         directory = Path(self._path_edit.text().strip())
@@ -1501,6 +1404,13 @@ the limit before converging (cost still dropping at last iteration).
         )
 
     def _run_registration(self):
+        """Warp frame N-1 onto frame N using the loaded final transforms.
+
+        The from-scratch search (register_multiscale) has been removed: the
+        transforms are computed on the cluster and exported, and a second
+        implementation here only invited the two to disagree. Load a
+        RegisteredTransforms_*.json first.
+        """
         frame_num = self._frame_spin.value()
         prev_num  = frame_num - 1
 
@@ -1509,34 +1419,30 @@ the limit before converging (cost still dropping at last iteration).
             self.label.setText("Load the current frame first")
             return
 
-        reg_res  = 2
-        name_out = f"{prev_num}_registered_to_{frame_num}"
+        if self._final_transforms is None:
+            self.label.setText(
+                "No registration transforms loaded - choose a "
+                "RegisteredTransforms_*.json above and press 'Load Final "
+                "Registration Transforms'."
+            )
+            return
+
+        reg_res   = 2
         data_curr = layer_curr.data.copy()
+        precomputed = pairwise_transform_from_final(
+            self._final_transforms, prev_num, frame_num, reg_res)
+        if precomputed is None:
+            self.label.setText(
+                f"The loaded transforms do not cover frame {prev_num} or {frame_num}."
+            )
+            return
 
-        # If final registration transforms are loaded and cover this exact
-        # frame pair, use the precomputed transform directly instead of
-        # running register_multiscale's from-scratch search. The transforms
-        # file must be explicitly chosen (via "Load Final Registration
-        # Transforms") -- self._final_transforms stays None otherwise, so
-        # this never silently kicks in.
-        precomputed = None
-        if self._final_transforms is not None:
-            precomputed = pairwise_transform_from_final(self._final_transforms, prev_num, frame_num, reg_res)
-            if precomputed is None:
-                self.label.setText(
-                    f"Final transforms loaded but frame {prev_num} or {frame_num} not found in them — "
-                    f"falling back to search-based registration…"
-                )
-
-        # The previous frame's labels: prefer whatever is already loaded/
-        # carried-over as "previous" (may carry manual edits), but when a
-        # precomputed transform is available, fall back to reading the
-        # previous frame's raw label file straight from disk -- the
-        # transform-based path needs no interactive prep on it, so it
-        # doesn't need to have been loaded as a viewer layer at all.
+        # Prefer the previous frame as loaded (it may carry manual edits);
+        # otherwise read it straight from disk - the transform is known, so
+        # it needs no interactive prep.
         if self._layer_prev is not None:
             data_prev = self._layer_prev.data.copy()
-        elif precomputed is not None:
+        else:
             directory = Path(self._path_edit.text().strip())
             prev_path = _find_frame(directory, prev_num) if directory.is_dir() else None
             if prev_path is None:
@@ -1547,104 +1453,10 @@ the limit before converging (cost still dropping at last iteration).
             self._prev_orig_path     = prev_orig if prev_orig != prev_path else None
             self._reg_save_path      = prev_path.parent / f"registered_to_{frame_num}{prev_path.suffix}"
             self._orig_reg_save_path = prev_path.parent / f"original_registered_to_{frame_num}{prev_path.suffix}"
-        else:
-            self.label.setText(
-                f"Need frame {prev_num}'s labels — load it first (so it carries over as "
-                f"'previous'), or load final registration transforms covering this pair "
-                f"(then it's read straight from disk)."
-            )
-            return
 
-        if precomputed is not None:
-            xform_name = Path(self._final_xform_path_edit.text().strip()).name
-            self._run_registration_from_transform(precomputed, frame_num, prev_num,
-                                                    data_prev, data_curr, reg_res, xform_name)
-            return
-
-        self._btn_reg.setEnabled(False)
-        self.label.setText(
-            f"Registering '{self._layer_prev.name}' → '{layer_curr.name}'  (reg_res={reg_res})…"
-        )
-
-        reg_params = {
-            'max_nfev':      self._max_nfev.value(),
-            'n_starts':      self._n_starts.value(),
-            'angle_perturb': self._angle_perturb.value(),
-            'trans_perturb': self._trans_perturb.value(),
-        }
-
-        signals = _WorkerSignals()
-
-        def _on_done(result):
-            warped      = result['corrected']
-            warped_orig = result['original']
-            self._layer_reg = self.viewer.add_labels(warped, name=name_out)
-            msg = f"Registration done — '{name_out}' loaded"
-            if warped_orig is not None:
-                orig_name_out = f"{name_out}_orig"
-                self._layer_reg_orig = self.viewer.add_labels(warped_orig, name=orig_name_out)
-                msg += f", '{orig_name_out}' loaded"
-            self.label.setText(msg)
-            self._btn_reg.setEnabled(True)
-
-        def _on_error(exc):
-            import traceback
-            msg = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-            print(f"Registration error:\n{msg}", flush=True)
-            self.label.setText(f"Registration failed: {exc}")
-            self._btn_reg.setEnabled(True)
-
-        signals.done.connect(_on_done)
-        signals.error.connect(_on_error)
-
-        save_path      = self._reg_save_path        # capture before entering thread
-        orig_save_path = self._orig_reg_save_path
-        prev_orig_path = self._prev_orig_path
-        prev_name      = self._layer_prev.name
-
-        def _run():
-            try:
-                print(f"Prep prev frame: {prev_name}", flush=True)
-                bnd_prev, orig_prev, _ = prep_array(data_prev, reg_res)
-                print(f"Prep curr frame: {layer_curr.name}", flush=True)
-                bnd_curr, orig_curr, _ = prep_array(data_curr, reg_res)
-                params = register_multiscale(
-                    bnd_prev.astype(np.float32), bnd_curr.astype(np.float32), np.zeros(6),
-                    max_nfev=reg_params['max_nfev'],
-                    n_random_starts=reg_params['n_starts'],
-                    angle_perturb=reg_params['angle_perturb'],
-                    translation_perturb=reg_params['trans_perturb'],
-                )
-                R = euler_angles_to_rotation_matrix(params[:3])
-                t = params[3:]
-                warped = warp_to_original_space(orig_prev, R, t, reg_res, orig_curr.shape)
-
-                # also warp the original (non-corrected) prev frame with the same transform
-                warped_orig = None
-                if prev_orig_path is not None:
-                    print(f"Warping original (non-corrected) prev frame: {prev_orig_path.name}…",
-                          flush=True)
-                    data_orig = tifffile.imread(str(prev_orig_path)).astype(np.uint32)
-                    _, orig_prev_uncorr, _ = prep_array(data_orig, reg_res)
-                    warped_orig = warp_to_original_space(
-                        orig_prev_uncorr, R, t, reg_res, orig_curr.shape
-                    )
-
-                # save to disk in the background thread — not on the Qt main thread
-                if save_path is not None:
-                    print(f"Saving registered frame to {save_path}…", flush=True)
-                    tifffile.imwrite(str(save_path), warped)
-                    print(f"Saved → {save_path.name}", flush=True)
-                if warped_orig is not None and orig_save_path is not None:
-                    print(f"Saving original registered frame to {orig_save_path}…", flush=True)
-                    tifffile.imwrite(str(orig_save_path), warped_orig)
-                    print(f"Saved → {orig_save_path.name}", flush=True)
-
-                signals.done.emit({'corrected': warped, 'original': warped_orig})
-            except Exception as exc:
-                signals.error.emit(exc)
-
-        threading.Thread(target=_run, daemon=True).start()
+        xform_name = Path(self._final_xform_path_edit.text().strip()).name
+        self._run_registration_from_transform(precomputed, frame_num, prev_num,
+                                               data_prev, data_curr, reg_res, xform_name)
 
     def _run_registration_from_transform(self, precomputed, frame_num, prev_num,
                                           data_prev, data_curr, reg_res, xform_name):
@@ -1745,36 +1557,48 @@ the limit before converging (cost still dropping at last iteration).
         return sorted(nums)
 
     def _run_register_all(self):
+        """Warp every frame onto one reference using the loaded transforms.
+
+        Same source of truth as the single-pair button: no search, so a run
+        here cannot disagree with the exported registration.
+        """
         directory = Path(self._path_edit.text().strip())
         if not directory.is_dir():
             self.label.setText(f"Not a directory: {directory}")
             return
+        if self._final_transforms is None:
+            self.label.setText(
+                "No registration transforms loaded - choose a "
+                "RegisteredTransforms_*.json above and press 'Load Final "
+                "Registration Transforms'."
+            )
+            return
 
         seg_dir = directory / "membrane_segmentation"
         search_dir = seg_dir if seg_dir.is_dir() else directory
-
         all_frames = self._all_frame_numbers(search_dir)
         if len(all_frames) < 2:
             self.label.setText("Need at least 2 frames for Register All")
             return
 
+        reg_res = 2
         to_last = self._chk_reg_to_last.isChecked()
         ref_num = all_frames[-1] if to_last else all_frames[0]
-        moving_frames = [n for n in all_frames if n != ref_num]
+        moving  = [n for n in all_frames if n != ref_num]
+        xform_name = Path(self._final_xform_path_edit.text().strip()).name
 
         self._btn_reg_all.setEnabled(False)
         self.label.setText(
-            f"Register All: {len(moving_frames)} frames → reference frame {ref_num}…"
-        )
+            f"Register All: {len(moving)} frames -> reference {ref_num} "
+            f"using '{xform_name}'…")
 
         signals = _WorkerSignals()
 
         def _on_done(result):
             n_done, n_skipped, n_failed = result
             self.label.setText(
-                f"Register All done — {n_done} registered, "
-                f"{n_skipped} skipped, {n_failed} failed"
-            )
+                f"Register All done - {n_done} registered, {n_skipped} skipped, "
+                f"{n_failed} failed")
             self._btn_reg_all.setEnabled(True)
 
         def _on_error(exc):
@@ -1783,13 +1607,7 @@ the limit before converging (cost still dropping at last iteration).
 
         signals.done.connect(_on_done)
         signals.error.connect(_on_error)
-
-        reg_params = {
-            'max_nfev':      self._max_nfev.value(),
-            'n_starts':      self._n_starts.value(),
-            'angle_perturb': self._angle_perturb.value(),
-            'trans_perturb': self._trans_perturb.value(),
-        }
+        transforms = self._final_transforms
 
         def _run():
             try:
@@ -1797,48 +1615,164 @@ the limit before converging (cost still dropping at last iteration).
                 if ref_path is None:
                     signals.error.emit(Exception(f"Reference frame {ref_num} not found"))
                     return
-                ref_img = tifffile.imread(str(ref_path)).astype(np.uint32)
-                bnd_ref, orig_ref, _ = prep_array(ref_img, 2)
+                ref_shape = tifffile.imread(str(ref_path)).shape
 
                 n_done = n_skipped = n_failed = 0
-                for frame_num in moving_frames:
-                    out_path = search_dir / f"{frame_num}_registered_to_{ref_num}{ref_path.suffix}"
+                for n in moving:
+                    out_path = search_dir / f"{n}_registered_to_{ref_num}{ref_path.suffix}"
                     if out_path.exists():
-                        print(f"[SKIP] frame {frame_num}: {out_path.name} already exists",
-                              flush=True)
+                        print(f"[SKIP] frame {n}: {out_path.name} exists", flush=True)
                         n_skipped += 1
                         continue
-                    frame_path = _find_frame(directory, frame_num)
-                    if frame_path is None:
-                        print(f"[MISS] frame {frame_num}: file not found", flush=True)
+                    pre = pairwise_transform_from_final(transforms, n, ref_num, reg_res)
+                    if pre is None:
+                        print(f"[MISS] frame {n}: not covered by the transforms", flush=True)
+                        n_failed += 1
+                        continue
+                    src = _find_frame(directory, n)
+                    if src is None:
+                        print(f"[MISS] frame {n}: file not found", flush=True)
                         n_failed += 1
                         continue
                     try:
-                        frame_img = tifffile.imread(str(frame_path)).astype(np.uint32)
-                        bnd_frame, orig_frame, _ = prep_array(frame_img, 2)
-                        params = register_multiscale(
-                            bnd_frame.astype(np.float32), bnd_ref.astype(np.float32),
-                            np.zeros(6),
-                            max_nfev=reg_params['max_nfev'],
-                            n_random_starts=reg_params['n_starts'],
-                            angle_perturb=reg_params['angle_perturb'],
-                            translation_perturb=reg_params['trans_perturb'],
-                        )
-                        R = euler_angles_to_rotation_matrix(params[:3])
-                        t = params[3:]
-                        warped = warp_to_original_space(orig_frame, R, t, 2, orig_ref.shape)
-                        tifffile.imwrite(str(out_path), warped)
-                        print(f"  Saved → {out_path.name}", flush=True)
+                        data = tifffile.imread(str(src)).astype(np.uint32)
+                        M_reg, b_reg = pre
+                        warped = warp_to_original_space(data, M_reg, b_reg, reg_res, ref_shape)
+                        _write_label_tiff(out_path, warped)
                         n_done += 1
-                    except Exception as exc:
-                        import traceback
-                        traceback.print_exc()
-                        print(f"[FAIL] frame {frame_num}: {exc}", flush=True)
+                        print(f"[OK] frame {n} -> {out_path.name}", flush=True)
+                    except Exception as e:
+                        print(f"[FAIL] frame {n}: {e}", flush=True)
                         n_failed += 1
-
                 signals.done.emit((n_done, n_skipped, n_failed))
-            except Exception as exc:
-                signals.error.emit(exc)
+            except Exception as e:
+                signals.error.emit(e)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _run_update_io2(self):
+        """Recompute this frame's Io2 pairs and merge them into the table.
+
+        A pair (f, f+1) is built from exactly two frames, so correcting frame
+        F invalidates pairs F-1 and F and nothing else: three frames are
+        warped instead of the whole sequence. The table is the one beside the
+        loaded transforms JSON, and the current frame is taken from the
+        viewer so unsaved edits count.
+        """
+        if self._final_transforms is None:
+            self.label.setText(
+                "Load the registration transforms first - the Io2 table is "
+                "built from them and is written beside them.")
+            return
+        if self._layer_curr is None or self._curr_frame_num is None:
+            self.label.setText("Load a frame first")
+            return
+
+        frame_num = self._curr_frame_num
+        xform_path = Path(self._final_xform_path_edit.text().strip())
+        table_path = xform_path.parent / f"Io2Table_{xform_path.stem}.json"
+        if not table_path.exists():
+            self.label.setText(
+                f"No table to update at {table_path.name} - build it once with "
+                f"ComputeIo2TableFromTransforms.py, then this button keeps it current.")
+            return
+
+        begin = self._final_transforms['begin_frame']
+        end   = self._final_transforms['end_frame']
+        resolution = self._final_transforms['resolution_um']
+        pairs = [f for f in (frame_num - 1, frame_num) if begin <= f <= end - 1]
+        if not pairs:
+            self.label.setText(f"Frame {frame_num} takes part in no pair in {begin}..{end}")
+            return
+
+        directory = Path(self._path_edit.text().strip())
+        min_size = self._io2_min_size.value()
+        curr_data = np.asarray(self._layer_curr.data).copy()
+        self._btn_io2.setEnabled(False)
+        self.label.setText(
+            f"Updating Io2 pairs {pairs} in {table_path.name} "
+            f"(frame {frame_num} from the viewer)…")
+
+        signals = _WorkerSignals()
+
+        def _on_done(result):
+            lines, backup = result
+            self._results.setPlainText("\n".join(lines))
+            self.label.setText(
+                f"Io2 table updated: pairs {pairs} in {table_path.name}\n"
+                f"previous table kept as {backup.name}")
+            self._btn_io2.setEnabled(True)
+
+        def _on_error(exc):
+            self.label.setText(f"Io2 update failed: {exc}")
+            self._btn_io2.setEnabled(True)
+
+        signals.done.connect(_on_done)
+        signals.error.connect(_on_error)
+
+        def _run():
+            try:
+                from RegisterLabelPairIo2 import compute_io2_table
+            except ImportError as e:
+                signals.error.emit(Exception(
+                    f"{e} - RegisterLabelPairIo2.py must be importable "
+                    f"(it lives with the lineage code)"))
+                return
+            try:
+                from scipy.ndimage import affine_transform, zoom
+                from skimage.measure import label as sk_label
+                import skimage.morphology as morphology
+
+                def warp(f):
+                    if f == frame_num:
+                        img = curr_data
+                    else:
+                        src = _find_frame(directory, f)
+                        if src is None:
+                            raise FileNotFoundError(f'frame {f} not found in {directory}')
+                        img = tifffile.imread(str(src))
+                    z = (_RES_Z_MEMBRANE / resolution, _RES_XY / resolution,
+                         _RES_XY / resolution)
+                    img = zoom(img, z, order=0)
+                    if min_size > 1:
+                        cc = sk_label(img, connectivity=img.ndim)
+                        cc = morphology.remove_small_objects(cc, min_size=min_size)
+                        img = img.copy()
+                        img[cc == 0] = 0
+                    e = self._final_transforms['frames'][str(f)]
+                    return affine_transform(img.astype(np.float32),
+                                            np.array(e['matrix']), np.array(e['offset']),
+                                            order=0).astype(img.dtype)
+
+                with open(table_path) as fh:
+                    table = json.load(fh)
+                from datetime import datetime
+                backup = table_path.with_name(
+                    f'{table_path.stem}.pre{datetime.now():%Y%m%d_%H%M%S}.json')
+                shutil.copy2(table_path, backup)
+
+                cache, lines = {}, []
+                for f in pairs:
+                    for g in (f, f + 1):
+                        if g not in cache:
+                            cache[g] = warp(g)
+                            print(f'  warped frame {g}', flush=True)
+                    io2 = compute_io2_table(cache[f], cache[f + 1])
+                    before = table.get(str(f))
+                    table[str(f)] = io2
+                    new = [v for row in io2.values() for v in row.values() if v > 0]
+                    old = ([v for row in before.values() for v in row.values() if v > 0]
+                           if before else [])
+                    lines.append(
+                        f"pair {f}->{f+1}: mean {np.mean(new):.4f} (n={len(new)})"
+                        + (f"   was {np.mean(old):.4f} (n={len(old)})" if old else ""))
+                    print(' ', lines[-1], flush=True)
+
+                with open(table_path, 'w') as fh:
+                    json.dump(table, fh)
+                signals.done.emit((lines, backup))
+            except Exception as e:
+                signals.error.emit(e)
 
         threading.Thread(target=_run, daemon=True).start()
 
