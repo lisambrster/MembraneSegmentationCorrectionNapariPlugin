@@ -479,12 +479,16 @@ class TiffReaderWidget(QWidget):
         )
         self._btn_clean_all.clicked.connect(self._run_clean_all_monotonic)
         tools_row.addWidget(self._btn_clean_all)
-        tools_row.addWidget(QLabel("start at"))
+        tools_row.addWidget(QLabel("start cells"))
         self._start_count = QSpinBox()
         self._start_count.setRange(1, 1000)
-        self._start_count.setValue(3)
+        self._start_count.setValue(2)
         self._start_count.setFixedWidth(55)
-        self._start_count.setToolTip("Cell count the sequence must start at")
+        self._start_count.setToolTip(
+            "Cell count the sequence must start at. The polar body is kept\n"
+            "whenever one is present and is NOT counted here, so a 2-cell\n"
+            "frame with a polar body gives 3 objects."
+        )
         tools_row.addWidget(self._start_count)
         self._btn_prep_all = QPushButton("Prep ALL (no save)")
         self._btn_prep_all.setToolTip(
@@ -1233,7 +1237,7 @@ class TiffReaderWidget(QWidget):
                           f"pool {row['pool']:>3} -> {row['kept']:>3} "
                           f"(need {row['need']}) {row['note']}", flush=True)
                 rows = monotonic_keep_sets(all_frames, _load, mod,
-                                           start_count=start_count,
+                                           start_cells=start_count,
                                            min_cell_frac=self._min_vol_frac(),
                                            progress=_progress)
                 head, table, _ = summarise(rows)
