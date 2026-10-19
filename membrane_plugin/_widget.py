@@ -570,17 +570,16 @@ class TiffReaderWidget(QWidget):
         layout.addWidget(self._btn_rbs)
 
         self._btn_reg = QPushButton("")
+        self._btn_reg.setToolTip(
+            "Warp frame N-1 onto frame N using the transforms loaded above."
+        )
         self._btn_reg.clicked.connect(self._run_registration)
+        # the label is built from the frame number, so it must be set now and
+        # kept in step - without this the button renders with no text at all
+        self._frame_spin.valueChanged.connect(self._update_reg_label)
+        self._update_reg_label(self._frame_spin.value())
         layout.addWidget(self._btn_reg)
 
-        reg_all_row = QHBoxLayout()
-        self._btn_reg_all = QPushButton("Register All")
-        self._btn_reg_all.clicked.connect(self._run_register_all)
-        self._chk_reg_to_last = QCheckBox("to last frame")
-        self._chk_reg_to_last.setChecked(False)
-        reg_all_row.addWidget(self._btn_reg_all)
-        reg_all_row.addWidget(self._chk_reg_to_last)
-        layout.addLayout(reg_all_row)
 
         # --- Check / Fix membrane pairs ---
         btn_check = QPushButton("Check Membrane Pairs")
@@ -1560,99 +1559,6 @@ class TiffReaderWidget(QWidget):
                 nums.add(tok)
         return sorted(nums)
 
-    def _run_register_all(self):
-        """Warp every frame onto one reference using the loaded transforms.
-
-        Same source of truth as the single-pair button: no search, so a run
-        here cannot disagree with the exported registration.
-        """
-        directory = Path(self._path_edit.text().strip())
-        if not directory.is_dir():
-            self.label.setText(f"Not a directory: {directory}")
-            return
-        if self._final_transforms is None:
-            self.label.setText(
-                "No registration transforms loaded - choose a "
-                "RegisteredTransforms_*.json above and press 'Load Final "
-                "Registration Transforms'."
-            )
-            return
-
-        seg_dir = directory / "membrane_segmentation"
-        search_dir = seg_dir if seg_dir.is_dir() else directory
-        all_frames = self._all_frame_numbers(search_dir)
-        if len(all_frames) < 2:
-            self.label.setText("Need at least 2 frames for Register All")
-            return
-
-        reg_res = 2
-        to_last = self._chk_reg_to_last.isChecked()
-        ref_num = all_frames[-1] if to_last else all_frames[0]
-        moving  = [n for n in all_frames if n != ref_num]
-        xform_name = Path(self._final_xform_path_edit.text().strip()).name
-
-        self._btn_reg_all.setEnabled(False)
-        self.label.setText(
-            f"Register All: {len(moving)} frames -> reference {ref_num} "
-            f"using '{xform_name}'…")
-
-        signals = _WorkerSignals()
-
-        def _on_done(result):
-            n_done, n_skipped, n_failed = result
-            self.label.setText(
-                f"Register All done - {n_done} registered, {n_skipped} skipped, "
-                f"{n_failed} failed")
-            self._btn_reg_all.setEnabled(True)
-
-        def _on_error(exc):
-            self.label.setText(f"Register All failed: {exc}")
-            self._btn_reg_all.setEnabled(True)
-
-        signals.done.connect(_on_done)
-        signals.error.connect(_on_error)
-        transforms = self._final_transforms
-
-        def _run():
-            try:
-                ref_path = _find_frame(directory, ref_num)
-                if ref_path is None:
-                    signals.error.emit(Exception(f"Reference frame {ref_num} not found"))
-                    return
-                ref_shape = tifffile.imread(str(ref_path)).shape
-
-                n_done = n_skipped = n_failed = 0
-                for n in moving:
-                    out_path = search_dir / f"{n}_registered_to_{ref_num}{ref_path.suffix}"
-                    if out_path.exists():
-                        print(f"[SKIP] frame {n}: {out_path.name} exists", flush=True)
-                        n_skipped += 1
-                        continue
-                    pre = pairwise_transform_from_final(transforms, n, ref_num, reg_res)
-                    if pre is None:
-                        print(f"[MISS] frame {n}: not covered by the transforms", flush=True)
-                        n_failed += 1
-                        continue
-                    src = _find_frame(directory, n)
-                    if src is None:
-                        print(f"[MISS] frame {n}: file not found", flush=True)
-                        n_failed += 1
-                        continue
-                    try:
-                        data = tifffile.imread(str(src)).astype(np.uint32)
-                        M_reg, b_reg = pre
-                        warped = warp_to_original_space(data, M_reg, b_reg, reg_res, ref_shape)
-                        _write_label_tiff(out_path, warped)
-                        n_done += 1
-                        print(f"[OK] frame {n} -> {out_path.name}", flush=True)
-                    except Exception as e:
-                        print(f"[FAIL] frame {n}: {e}", flush=True)
-                        n_failed += 1
-                signals.done.emit((n_done, n_skipped, n_failed))
-            except Exception as e:
-                signals.error.emit(e)
-
-        threading.Thread(target=_run, daemon=True).start()
 
     def _run_update_io2(self):
         """Recompute this frame's Io2 pairs and merge them into the table.
