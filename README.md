@@ -58,9 +58,15 @@ pip install numba
 
 1. Enter the experiment root path and frame number, click **Load**
 2. Click **Remove Bad Slices** (manual or auto) and **Prep** to clean labels if needed
-3. Click **Register frame N-1 → frame N** to align the previous frame
-4. Click **Check Membrane Pairs** to find inconsistencies
-5. Click **Fix Seg Errors** if errors were found
+3. To delete one bad cell, click **Pick** (this puts the layer into napari's pick mode), then click the cell in the viewer — its id appears in the **Remove label id** box — then click **Remove**. You can also type an id directly. **Undo remove** restores the last one. Surviving labels keep their ids.
+4. **Prep ALL frames** applies the Min volume threshold to every frame on disk, writing each result as a **new version beside its original** (`Corrected` → `Corrected1`) so **Load** opens the cleaned frames straight away while the originals survive. The whole sequence lands on one suffix, so a single `membrane_label_path` pattern still matches. Tick **overwrite originals** to replace in place instead (not undoable). Progress is printed per frame.
+5. **Save frame (new version)** writes the active layer beside its source with the version bumped — `Corrected` → `Corrected1` → `Corrected2`, `corrected_4` → `corrected_5`. The original is never overwritten, and the frame number is never touched.
+6. **Save ALL frames (new version)** versions the whole sequence at once, every frame landing on the *same* suffix so a single `membrane_label_path` pattern still matches. The loaded frame is written from memory (including edits); the rest are carried across from disk.
+7. **Clean ALL frames (shape + connectivity)** runs `CleanEmbryoSegmentation.clean_volume` over every frame — drops flat/sprawling objects, keeps the largest connected group — and writes the result exactly as Prep ALL does, so Load opens the cleaned frames. A frame with no identifiable embryo is **carried through unchanged** rather than blanked or skipped, and listed in the report; the per-frame table shows labels in/out, embryo volume and median fill.
+8. Click **Cells per frame** to count labels in every frame and flag any drop (cell count should only increase).
+9. Click **Register frame N-1 → frame N** to align the previous frame
+10. Click **Check Membrane Pairs** to find inconsistencies
+11. Click **Fix Seg Errors** if errors were found
 
 ## Batch registration
 
