@@ -354,6 +354,41 @@ class _CollapsiblePanel(QWidget):
         self._body.setVisible(checked)
 
 
+class _CollapsibleSection(QWidget):
+    """A titled section that folds its rows away.
+
+    The panel is ~1050 px tall and a napari dock rarely gets that much, so
+    the search parameters - which are set once and then left alone - start
+    folded. Nothing is removed; the arrow expands them again.
+    """
+
+    def __init__(self, title: str, inner_layout, expanded=False, parent=None):
+        super().__init__(parent)
+        self._toggle = QToolButton()
+        self._toggle.setText(title)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(expanded)
+        self._toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self._toggle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._toggle.clicked.connect(self._on_toggle)
+
+        self._body = QWidget()
+        self._body.setLayout(inner_layout)
+        self._body.setVisible(expanded)
+
+        lay = QVBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        lay.addWidget(self._toggle)
+        lay.addWidget(self._body)
+        self.setLayout(lay)
+
+    def _on_toggle(self, checked: bool):
+        self._body.setVisible(checked)
+        self._toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+
 class TiffReaderWidget(QWidget):
     def __init__(self, viewer: napari.Viewer):
         super().__init__()
@@ -620,11 +655,14 @@ the limit before converging (cost still dropping at last iteration).
         layout.addLayout(slice_row)
         layout.addWidget(self._btn_rbs)
 
-        layout.addLayout(starts_row)
-        layout.addLayout(nfev_row)
-        layout.addLayout(perturb_row)
-        layout.addLayout(trans_row)
-        layout.addWidget(tips)
+        reg_params = QVBoxLayout()
+        reg_params.setContentsMargins(8, 0, 0, 0)
+        reg_params.addLayout(starts_row)
+        reg_params.addLayout(nfev_row)
+        reg_params.addLayout(perturb_row)
+        reg_params.addLayout(trans_row)
+        reg_params.addWidget(tips)
+        layout.addWidget(_CollapsibleSection("Registration search settings", reg_params))
         layout.addWidget(self._btn_reg)
 
         reg_all_row = QHBoxLayout()
