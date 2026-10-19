@@ -10,7 +10,7 @@ from qtpy.QtCore import Qt, QObject, Signal
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QFileDialog, QLabel, QSpinBox, QToolButton, QSizePolicy,
-    QDoubleSpinBox, QPlainTextEdit, QLineEdit, QCheckBox,
+    QDoubleSpinBox, QPlainTextEdit, QLineEdit, QCheckBox, QScrollArea,
 )
 import napari
 from napari.qt import thread_worker
@@ -680,7 +680,30 @@ the limit before converging (cost still dropping at last iteration).
 
         # after the UI and the state above exist, not before
         self._track_selected_label()
-        self.setLayout(layout)
+        # The panel has more rows than a napari dock is usually given, and a
+        # dock cannot scroll a plain widget: the children's minimum heights
+        # become the widget's minimum, so the bottom rows end up off-screen
+        # and the dock refuses to shrink. Putting everything inside a
+        # QScrollArea decouples the two - the dock can be any size, and the
+        # panel scrolls within it.
+        inner = QWidget()
+        inner.setLayout(layout)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(inner)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+        self.setLayout(outer)
+
+        # let the dock be dragged narrow/short; the scroll area takes over
+        self.setMinimumSize(1, 1)
+        inner.setMinimumWidth(320)
 
     def _load_as_labels(self, path: Path):
         img = tifffile.imread(str(path))
