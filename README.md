@@ -63,10 +63,11 @@ pip install numba
 5. **Save frame (new version)** writes the active layer beside its source with the version bumped — `Corrected` → `Corrected1` → `Corrected2`, `corrected_4` → `corrected_5`. The original is never overwritten, and the frame number is never touched.
 6. **Save ALL frames (new version)** versions the whole sequence at once, every frame landing on the *same* suffix so a single `membrane_label_path` pattern still matches. The loaded frame is written from memory (including edits); the rest are carried across from disk.
 7. **Clean ALL frames (shape + connectivity)** runs `CleanEmbryoSegmentation.clean_volume` over every frame — drops flat/sprawling objects, keeps the largest connected group — and writes the result exactly as Prep ALL does, so Load opens the cleaned frames. A frame with no identifiable embryo is **carried through unchanged** rather than blanked or skipped, and listed in the report; the per-frame table shows labels in/out, embryo volume and median fill.
-8. Click **Cells per frame** to count labels in every frame and flag any drop (cell count should only increase).
-9. Click **Register frame N-1 → frame N** to align the previous frame
-10. Click **Check Membrane Pairs** to find inconsistencies
-11. Click **Fix Seg Errors** if errors were found
+8. **Clean ALL (monotonic, no save)** cleans every frame with the cell count constrained so it never decreases (starting at the **start at** value). The polar body trips both the fragment cut and the flatness filter inconsistently — one or two z-slices thick, its flatness swings between 0.10 and 0.99 frame to frame — so no per-frame threshold separates it, but the sequence can: when the count would drop, the object that holds it level is put back. Candidates are admitted largest-first and never below 100 µm³, so the constraint cannot invent a cell; a frame that still falls short is FLAGGED, meaning the cell is missing from the segmentation itself. The decision is cached per frame, so loading a frame afterwards shows the constrained result. Reads the files on disk, writes nothing.
+9. Click **Cells per frame** to count labels in every frame and flag any drop (cell count should only increase).
+10. Click **Register frame N-1 → frame N** to align the previous frame
+11. Click **Check Membrane Pairs** to find inconsistencies
+12. Click **Fix Seg Errors** if errors were found
 
 ## Batch registration
 

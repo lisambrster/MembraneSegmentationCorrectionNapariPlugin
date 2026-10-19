@@ -20,6 +20,7 @@ from membrane_plugin._registration import (
     euler_angles_to_rotation_matrix, warp_to_original_space,
 )
 from membrane_plugin._paircheck import check_frame_pair, fix_seg_errors, summary_text
+from membrane_plugin._monotonic import monotonic_keep_sets, apply_keep, summarise
 
 _CONFIG = Path.home() / ".membrane_plugin.json"
 
@@ -510,6 +511,21 @@ class TiffReaderWidget(QWidget):
         save_row.addWidget(self._btn_save_all)
 
         tools_row = QHBoxLayout()
+        self._btn_clean_all = QPushButton("Clean ALL (monotonic, no save)")
+        self._btn_clean_all.setToolTip(
+            "Clean every frame with the count constrained so it never drops.\n"
+            "Decides each frame once and caches it, so loading a frame after\n"
+            "this shows the constrained result. Nothing is written."
+        )
+        self._btn_clean_all.clicked.connect(self._run_clean_all_monotonic)
+        tools_row.addWidget(self._btn_clean_all)
+        tools_row.addWidget(QLabel("start at"))
+        self._start_count = QSpinBox()
+        self._start_count.setRange(1, 1000)
+        self._start_count.setValue(3)
+        self._start_count.setFixedWidth(55)
+        self._start_count.setToolTip("Cell count the sequence must start at")
+        tools_row.addWidget(self._start_count)
         self._btn_prep_all = QPushButton("Prep ALL (no save)")
         self._btn_prep_all.setToolTip(
             "Apply Prep to every frame and report the per-frame cell counts.\n"
@@ -715,6 +731,7 @@ the limit before converging (cost still dropping at last iteration).
         self._curr_frame_num     = None   # frame number self._layer_curr currently holds
         self._last_removed       = None   # (layer, volume before last Remove, label id)
         self._picked_layer       = None   # Labels layer whose selected_label the box mirrors
+        self._mono_keep          = {}     # frame -> row from the monotonic pass
 
         # after the UI and the state above exist, not before
         self._track_selected_label()
@@ -912,20 +929,33 @@ the limit before converging (cost still dropping at last iteration).
             notes.append(f"prep {before}->{after}")
 
         if self._chk_clean_on_load.isChecked():
-            mod = _clean_embryo_module()
-            if mod is None:
-                notes.append("clean SKIPPED (CleanEmbryoSegmentation.py not found)")
+            before = int(np.count_nonzero(np.unique(data)))
+            row = self._mono_keep.get(frame_num)
+            if row is not None:
+                # the constrained decision for this frame, made with the whole
+                # sequence in view; a per-frame clean cannot see the count
+                data = apply_keep(data, row['keep'])
+                note = f"clean {before}->{row['kept']} (monotonic, need {row['need']})"
+                if row['relaxed']:
+                    note += f" +{len(row['admitted'])} admitted"
+                if row['flagged']:
+                    note += "  FLAGGED: " + row['note']
+                notes.append(note)
             else:
-                before = int(np.count_nonzero(np.unique(data)))
-                cleaned, rep = mod.clean_volume(data)
-                if rep['status'] == 'ok':
-                    data = cleaned
-                    notes.append(f"clean {before}->{int(np.count_nonzero(np.unique(data)))}"
-                                 f" ({rep['embryo_vol_um3']:,.0f} um^3)")
+                mod = _clean_embryo_module()
+                if mod is None:
+                    notes.append("clean SKIPPED (CleanEmbryoSegmentation.py not found)")
                 else:
-                    # clean_volume returns an EMPTY volume when it finds no
-                    # embryo - never show that as if it were a result
-                    notes.append(f"clean kept as-is ({rep.get('reason','no embryo')})")
+                    cleaned, rep = mod.clean_volume(data)
+                    if rep['status'] == 'ok':
+                        data = cleaned
+                        notes.append(
+                            f"clean {before}->{int(np.count_nonzero(np.unique(data)))}"
+                            f" (per-frame; run Clean ALL for the monotonic version)")
+                    else:
+                        # clean_volume returns an EMPTY volume when it finds no
+                        # embryo - never show that as if it were a result
+                        notes.append(f"clean kept as-is ({rep.get('reason','no embryo')})")
         return data, notes
 
     def _run_prep(self):
@@ -1228,6 +1258,92 @@ the limit before converging (cost still dropping at last iteration).
         picked = int(self._picked_layer.selected_label)
         if picked > 0:                     # 0 is background: leave the box alone
             self._remove_id.setValue(picked)
+
+    def _run_clean_all_monotonic(self):
+        """Clean every frame with the count constrained, writing nothing.
+
+        The constraint is a property of the SEQUENCE, so it cannot be decided
+        at load time one frame at a time: the floor for frame N depends on
+        every frame before it. This pass decides all of them once and caches
+        the keep-set per frame; Load then applies the cached decision, which
+        is why the clean-on-load tick-box shows the constrained result
+        afterwards and a plain per-frame clean before.
+        """
+        directory = Path(self._path_edit.text().strip())
+        if not directory.is_dir():
+            self.label.setText(f"Not a directory: {directory}")
+            return
+        mod = _clean_embryo_module()
+        if mod is None:
+            self.label.setText(
+                "CleanEmbryoSegmentation.py not found - set CLEAN_EMBRYO_PATH "
+                "to it, or put it beside this plugin")
+            return
+
+        seg_dir = directory / "membrane_segmentation"
+        search_dir = seg_dir if seg_dir.is_dir() else directory
+        all_frames = self._all_frame_numbers(search_dir)
+        if not all_frames:
+            self.label.setText(f"No frames found in {search_dir}")
+            return
+
+        start_count = self._start_count.value()
+        self._btn_clean_all.setEnabled(False)
+        self.label.setText(
+            f"Clean ALL (monotonic, start {start_count}): {len(all_frames)} frames "
+            f"from disk, ~1s each, writing nothing…")
+
+        signals = _WorkerSignals()
+
+        def _on_done(result):
+            rows, head, table = result
+            self._mono_keep = rows
+            if not self._chk_clean_on_load.isChecked():
+                self._chk_clean_on_load.setChecked(True)
+            self._results.setPlainText(table)
+            self.label.setText(head + "\n[in memory - Save when you want it kept]")
+            self._btn_clean_all.setEnabled(True)
+
+        def _on_error(exc):
+            self.label.setText(f"Clean ALL failed: {exc}")
+            self._btn_clean_all.setEnabled(True)
+
+        signals.done.connect(_on_done)
+        signals.error.connect(_on_error)
+
+        def _load(n):
+            # Deliberately the file, never the open layer. A loaded layer has
+            # already had the on-load cleaning applied to it, so feeding it
+            # back in would clean the cleaned result and the pass could never
+            # recover an object the per-frame filters had removed. Save edits
+            # first if they should count.
+            src = _find_frame(directory, n)
+            if src is None:
+                print(f"[MISS] frame {n}: file not found", flush=True)
+                return None
+            return tifffile.imread(str(src))
+
+        def _run():
+            try:
+                def _progress(row):
+                    print(f"  frame {row['frame']:>4}: raw {row['raw']:>3} "
+                          f"pool {row['pool']:>3} -> {row['kept']:>3} "
+                          f"(need {row['need']}) {row['note']}", flush=True)
+                rows = monotonic_keep_sets(all_frames, _load, mod,
+                                           start_count=start_count,
+                                           min_cell_frac=self._min_vol_frac(),
+                                           progress=_progress)
+                head, table, _ = summarise(rows)
+                signals.done.emit((rows, head, table))
+            except Exception as e:
+                signals.error.emit(e)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    @staticmethod
+    def _min_vol_frac():
+        """Fragment cut used by the monotonic pass (clean_volume's default)."""
+        return 0.10
 
     def _run_prep_all_preview(self):
         """Prep every frame and show the counts - without writing anything.
