@@ -33,11 +33,15 @@ is missing from the segmentation itself, and no threshold brings it back.
 import numpy as np
 
 SHAPE_MIN_FLATNESS = 0.35
+PB_CANDIDATE_CAP = 4      # most polar bodies a frame can offer
 SHAPE_MAX_XYFRAC = 0.45
 
 
 def monotonic_keep_sets(frames, load, mod, start_cells=2, min_cell_frac=0.10,
-                        min_admit_um3=100.0, pb_max_frac=0.25, progress=None):
+                        min_admit_um3=100.0, pb_max_frac=0.25,
+                        cell_min_frac_of_max=0.05, keep_polar_body=True,
+                        max_polar_bodies='auto',
+                        progress=None):
     """Decide which labels to keep in each frame.
 
     Two separate rules, because the two kinds of object behave differently:
@@ -45,9 +49,10 @@ def monotonic_keep_sets(frames, load, mod, start_cells=2, min_cell_frac=0.10,
       * CELLS -- objects above the fragment cut. Their count may not decrease;
         an embryo only gains cells, so a drop is a cleaning artefact. When a
         frame falls short, candidates are admitted largest-first.
-      * The POLAR BODY -- an object far smaller than the median cell
-        (pb_max_frac of it). It is kept whenever one is present, whatever the
-        counts say, and nothing is expected when none is.
+      * POLAR BODIES -- objects far smaller than the median cell
+        (pb_max_frac of it). Up to max_polar_bodies of them are kept whenever
+        present, whatever the counts say, and nothing is expected when none
+        are. The default of 2 is what a mouse egg extrudes.
 
     The polar body is identified by SIZE, in each frame on its own. Following
     it from frame to frame would need the two frames registered, which is not
@@ -92,8 +97,18 @@ def monotonic_keep_sets(frames, load, mod, start_cells=2, min_cell_frac=0.10,
         else:
             feats = mod.label_features(lab, lab.shape)
             vol = lambda l: feats[l]['vol_um3']
-            med = float(np.median([vol(l) for l in pool])) if pool else 0.0
-            default = [l for l in pool if vol(l) >= min_cell_frac * med]
+            # What counts as a cell. The fragment cut is relative to the
+            # MEDIAN, which fails on raw cellpose output: at frame 92 of this
+            # embryo 11 objects survive shape+connectivity and their median
+            # is 145 um^3, because debris outnumbers blastomeres - so a cut
+            # at 10% of the median keeps everything. The second cut is
+            # relative to the LARGEST object instead, which is always a cell,
+            # and real cells never span more than a few fold within a frame.
+            vols = [vol(l) for l in pool]
+            med = float(np.median(vols)) if vols else 0.0
+            mx = max(vols) if vols else 0.0
+            cell_floor = max(min_cell_frac * med, cell_min_frac_of_max * mx)
+            default = [l for l in pool if vol(l) >= cell_floor]
 
             shape_ok = [l for l, f in feats.items()
                         if f['flatness'] >= SHAPE_MIN_FLATNESS
@@ -126,13 +141,32 @@ def monotonic_keep_sets(frames, load, mod, start_cells=2, min_cell_frac=0.10,
                 row['note'] = (f'only {len(cells)} cells of {need} - one is missing '
                                f'from the segmentation')
 
-            # 2. the polar body: keep any object far smaller than a cell
+            # 2. the polar body: an object far smaller than a cell. Kept by
+            # default; with keep_polar_body=False it is left out, which is
+            # what a cell-only set wants.
             med_cell = float(np.median([vol(l) for l in cells])) if cells else 0.0
             pb_cut = pb_max_frac * med_cell
             row['pb_cut_um3'] = pb_cut
-            pb = [l for l in feats
-                  if l not in cells and min_admit_um3 <= vol(l) < pb_cut]
-            pb = sorted(pb, key=lambda l: -vol(l))[:1]     # at most one
+            if keep_polar_body:
+                # Every candidate is recorded; how many to keep is decided
+                # once for the whole sequence, after the loop.
+                # Only the few largest are candidates. Raw cellpose output
+                # puts ~1000 fragments per frame between the admission floor
+                # and the polar-body cut; collecting them all made 'extras'
+                # read 1003 and bloated every keep-set before the trim. An
+                # embryo has at most a handful of polar bodies, so the rest
+                # can never be wanted.
+                pb = sorted((l for l in feats
+                             if l not in cells and min_admit_um3 <= vol(l) < pb_cut),
+                            key=lambda l: -vol(l))[:PB_CANDIDATE_CAP]
+                row['pb_candidates'] = [int(l) for l in pb]
+            else:
+                pb = []
+                dropped = [l for l in cells if vol(l) < pb_cut]
+                if dropped:
+                    cells = [l for l in cells if l not in dropped]
+                    row['pb_dropped'] = [dict(label=int(l), vol_um3=vol(l))
+                                          for l in dropped]
             for l in pb:
                 row['admitted'].append(dict(label=int(l), tier=tier.get(l, 0),
                                             vol_um3=vol(l),
@@ -154,7 +188,32 @@ def monotonic_keep_sets(frames, load, mod, start_cells=2, min_cell_frac=0.10,
         out[n] = row
         if progress is not None:
             progress(row)
-    return out
+
+    # How many polar bodies to keep, decided across the sequence rather than
+    # per frame. A mouse egg extrudes two, but a frame whose source had them
+    # stripped reports none, and then keeping two elsewhere makes the object
+    # count dip at that frame for no biological reason. So: keep them all
+    # only when EVERY frame offers the same number; otherwise keep the
+    # largest one, which is the one present most consistently.
+    if keep_polar_body and out:
+        counts = {len(r.get('pb_candidates', [])) for r in out.values()}
+        if max_polar_bodies == 'auto':
+            n_keep = counts.pop() if len(counts) == 1 else 1
+            uniform = len(counts) == 0
+        else:
+            n_keep, uniform = int(max_polar_bodies), False
+        for r in out.values():
+            cand = r.get('pb_candidates', [])
+            keep_pb = cand[:n_keep]
+            r['keep'] -= set(cand[n_keep:])
+            r['extras'] = len(keep_pb)
+            r['kept'] = len(r['keep'])
+            r['admitted'] = [a for a in r['admitted']
+                             if a.get('why') != 'polar body' or a['label'] in keep_pb]
+        out['_pb_rule'] = dict(per_frame_counts=sorted(
+            {len(r.get('pb_candidates', [])) for r in out.values() if isinstance(r, dict)
+             and 'frame' in r}), kept=n_keep, uniform=uniform)
+    return {k: v for k, v in out.items() if k != '_pb_rule'}
 
 
 def apply_keep(lab, keep):
